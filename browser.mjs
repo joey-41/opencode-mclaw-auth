@@ -10,7 +10,7 @@
  * 存在，续期时用 --headless=new 复开同一 profile，网页应用自己会刷新会话。
  */
 import { spawn } from 'node:child_process'
-import { access, mkdir, rm } from 'node:fs/promises'
+import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
@@ -41,19 +41,31 @@ async function claimProfileLock(profilePath) {
   const deadline = Date.now() + LOCK_TIMEOUT
   for (;;) {
     try {
-      await mkdir(lockDir) // 已存在 = 别人持锁
+      await mkdir(lockDir)
+      await writeFile(join(lockDir, 'pid'), String(process.pid)).catch(() => {})
       break
     } catch (error) {
       if (error.code !== 'EEXIST') throw error
+      // 持锁进程已经死了（上次没来得及清理）就偷走这把锁。
+      const holder = await readFile(join(lockDir, 'pid'), 'utf8').then((t) => Number(t.trim())).catch(() => NaN)
+      if (Number.isFinite(holder) && holder !== process.pid) {
+        let alive = true
+        try { process.kill(holder, 0) } catch (e) { alive = e.code === 'EPERM' }
+        if (!alive) {
+          await rm(lockDir, { recursive: true, force: true }).catch(() => {})
+          continue
+        }
+      }
       if (Date.now() >= deadline) throw new Error('MClaw 浏览器 profile 被其他操作占用，请稍后重试')
       await sleep(500)
     }
   }
   let released = false
-  return () => {
+  // 返回的 release 是 awaitable：调用方必须等它跑完再退出进程，否则 rm 会丢。
+  return async () => {
     if (released) return
     released = true
-    rm(lockDir, { recursive: true, force: true }).catch(() => {})
+    await rm(lockDir, { recursive: true, force: true }).catch(() => {})
   }
 }
 
@@ -333,12 +345,12 @@ export async function browserHarvestAfterLogin({ deadlineMs = 600_000 } = {}) {
       if (browser.connection.closed) throw new Error('浏览器被关闭，登录中断')
       const cookie = await harvestYunAuth(browser).catch(() => undefined)
       if (cookie?.value) return { cookie, profilePath, release, close: () => browser.close() }
-      if (Date.now() >= deadline) throw timeoutError('登录超时（10 分钟内没有检测到移动云登录）')
+      if (Date.now() >= deadline) throw timeoutError(`登录超时（${Math.round(deadlineMs / 60000)} 分钟内没有检测到移动云登录）`)
       await sleep(1500)
     }
   } catch (error) {
     await browser.close().catch(() => {})
-    release()
+    await release()
     throw error
   }
 }
@@ -369,6 +381,6 @@ export async function browserRefreshHarvest({ settleMs = 12_000, timeoutMs = 60_
     return { cookie, profilePath }
   } finally {
     await browser.close().catch(() => {})
-    release()
+    await release()
   }
 }

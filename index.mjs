@@ -724,7 +724,7 @@ export const MclawAuthPlugin = async (_input, options) => {
               return { type: 'success', refresh: 'browser', access: token, expires, metadata }
             } finally {
               await close().catch(() => {})
-              release()
+              await release()
             }
           },
         },
