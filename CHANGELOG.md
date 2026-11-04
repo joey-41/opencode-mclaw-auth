@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 — 2026-11-05
+
+- **浏览器登录（一次登录，凭证全自动）**：新增 oauth 型登录方式——插件弹专属 profile 的 Chrome（CDP 管道驱动 `--remote-debugging-pipe`，无端口、不碰系统浏览器），在窗口里完成移动云短信登录后，插件自动收割 `authorization` Cookie（= `pc:` 票，30 天期）。
+- **`/api/llm/apikey/get` v1 集成（key+倍率一步拿）**：Basic 票（`mobile:`/`pc:` 均可，实测）POST `{"channelId":"102001"}` 一次返回真正的 llm chat key + 9 模型倍率表。浏览器登录零手动粘贴；手动粘贴方式下倍率也改走此接口（config/get 降为兜底——它只认 App 渠道票）。
+- **自动续期**：oauth 账号到期前 3 天（refreshLead）宿主调 refresh 钩子，插件 headless 复开 profile，网页应用自己刷新会话后重新收割票（票变了顺手刷新 metadata.apiKey）。
+- llm key 自动获取失败时可手动填（浏览器登录方式里的可选项）；chat 仍只认 na- key（pc 票不能直连 chat，网页聊天走另一套中继协议不可复用）。
+- 新文件 browser.mjs（CDP 客户端，移植自 gcp-ai 的管道客户端，MIT）；profile 默认 `~/.config/magpie/mclaw-browser-profile`，`MCLAW_CHROME_PATH` / `MCLAW_BROWSER_PROFILE` 可覆盖。
+
 ## 0.3.0 — 2026-11-04
 
 - openclawId 完全自动发现（agent/list 免 userId，agentType=mclaw 的 agentId），仓库与代码不再含实例 ID。

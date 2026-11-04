@@ -12,15 +12,21 @@
  *
  *   models  POST https://ai.yun.139.com/api/adapter/assistant/agent/list
  *           Authorization: Basic base64("mobile:<手机号>:<token>")（App 抓包凭证）
+ *                        或 base64("pc:<手机号>:<token>")（网页登录票，等价）
  *           headers: x-yun-app-channel: 101, x-yun-api-version: v1,
  *                    Origin: mcloudlocal://yun.139.com
  *           body: {"sourceChannel":"101","sceneType":"homePage"}（免 userId）
  *           → agentList[] 里 agentType=mclaw 的 agentId 即 openclawId，
  *             其 modelList 是账号实际可用的模型。
  *
- *           POST https://ai.yun.139.com/api/openclaw/config/get
- *           body: {"sourceChannel":"101","openclawId":"<自动发现>"}
- *           → data.modelList[]: {code, name, tokenRatio, ability, currentlySelect}
+ *   key+倍率 POST https://ai.yun.139.com/api/llm/apikey/get
+ *           Authorization: Basic <同上>（mobile: / pc: 均可，实测）
+ *           headers: x-yun-api-version: v1   ← 必须 v1；v2 会返回另一个
+ *                    不能直连 chat 的 key 且要求 userId
+ *           body: {"channelId":"102001"}
+ *           → data: { apikey（真正的 llm key）, modelUrl,
+ *                     modelList[{modelCode, modelName, ability, tokenRatio}] }
+ *           一次拿全：chat key + 带倍率的模型表，无需手动粘贴 key。
  *
  *   usage   POST https://ypqy.mcloud.139.com/isbo2/openApi/queryAvailableBenefitV2
  *           Authorization: Basic <同上>（此接口可空账号，无需 userId）
@@ -33,14 +39,22 @@
  *           body: {"pageNum":1,"pageSize":3,"action":["1","4"]}
  *           → 每条：modelCode/modelName/benefitNum(消耗)/coefficient(倍率)/recordTime
  *
- *   两套凭证互不通用（实测对照过）：llm key 只管 chat；App Basic 凭证只管
- *   models/usage。Basic 凭证格式 "mobile:<手机号>:<…>|RCS|<到期ms>|<…>"，
- *   到期时间可从凭证文本里读出。
+ *   两套凭证互不通用（实测对照过）：llm key 只管 chat；Basic 票只管
+ *   models/usage/key发放。Basic 票格式 "<渠道>:<手机号>:<…>|RCS|<到期ms>|<…>"
+ *   （渠道 = mobile: App 票 / pc: 网页票），到期时间可从票文本里读出。
+ *   config/get（倍率）只认 mobile: 票 → 网页票的倍率走 apikey/get。
+ *
+ *   浏览器登录（v0.4.0）：yun.139.com 网页短信登录一次，CDP（--remote-
+ *   debugging-pipe，专属 profile）收割 authorization Cookie = pc: 票，
+ *   apikey/get v1 自动取 chat key + 倍率；续期 = headless 复开 profile，
+ *   网页应用自己刷新会话后重新收割。见 browser.mjs。
  *
  * Options (magpie plugin options mclaw '{"…"}'):
  *   { "base": "https://ai.yun.139.com/api/llm/102001" }
+ *   环境变量：MCLAW_CHROME_PATH（Chrome 路径）、MCLAW_BROWSER_PROFILE（登录 profile 目录）
  */
 import { randomUUID } from 'node:crypto'
+import { browserHarvestAfterLogin, browserRefreshHarvest } from './browser.mjs'
 
 const PROVIDER = 'mclaw'
 const DEFAULT_BASE = 'https://ai.yun.139.com/api/llm/102001'
@@ -224,6 +238,49 @@ async function fetchModelCatalogue(appAuth, openclawId) {
   return json.data.modelList
 }
 
+/** llm 渠道号（从 base 里推导，默认 102001）。 */
+function llmChannelId() {
+  return activeBase.match(/\/api\/llm\/(\d+)/)?.[1] ?? '102001'
+}
+
+/** apikey/get v1：Basic 票（mobile:/pc: 均可，实测）一次拿全 llm key + 带倍率模型表。
+ *  ⚠️ 必须 x-yun-api-version: v1——v2 返回另一个不能直连 chat 的 key，且要求 userId。 */
+async function fetchLlmKeyAndRates(appAuth, channelId = '102001') {
+  let response
+  try {
+    response = await fetch(`${OPENCLAW_BASE}/api/llm/apikey/get`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: appAuth,
+        'x-yun-api-version': 'v1',
+        'user-agent': APP_UA,
+      },
+      body: JSON.stringify({ channelId }),
+      signal: AbortSignal.timeout(15_000),
+    })
+  } catch {
+    throw new Error('MClaw key/倍率查询网络失败或超时')
+  }
+  const json = await readJson(response, 'MClaw key/倍率')
+  const data = json?.data
+  if (json?.success !== true || !data?.apikey) {
+    const code = json?.code ?? response.status
+    if (String(code) === '01000002' || response.status === 401) {
+      throw expired('MClaw Basic 票已失效，请重新登录')
+    }
+    throw new Error(`MClaw key/倍率查询失败（code ${code}：${json?.message ?? '未知错误'}）`)
+  }
+  return data
+}
+
+/** 两种存储形态的 Basic 票：oauth 型（浏览器登录）在 access，api 型（手动粘贴）
+ *  在 metadata.appAuth。 */
+function appAuthOf(auth) {
+  const raw = auth?.access ?? auth?.metadata?.appAuth
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined
+}
+
 /** aitokens 权益池（总量/已用）。空账号即可，无需 userId。 */
 async function fetchBenefit(appAuth) {
   let response
@@ -299,11 +356,11 @@ async function fetchNickName(vipCookie) {
   return typeof name === 'string' && name.trim() ? name.trim() : undefined
 }
 
-/** 从 App Basic 凭证里解出掩码手机号（mobile:138…:…），解不出返回空。 */
+/** 从 Basic 票里解出掩码手机号（mobile:/pc: 前缀均可），解不出返回空。 */
 function nameFromAppAuth(appAuth) {
   try {
     const raw = Buffer.from(appAuth.replace(/^Basic\s+/i, ''), 'base64').toString('utf8')
-    const phone = raw.match(/mobile:(\d{11})/)?.[1]
+    const phone = raw.match(/(?:mobile|pc):(\d{11})/)?.[1]
     return phone ? `${phone.slice(0, 3)}****${phone.slice(7)}` : undefined
   } catch {
     return undefined
@@ -474,11 +531,24 @@ let openclawIdCache
 // 插件装载时的 llm 基址（accountModels 在模块层，读不到插件闭包的 options）
 let activeBase = DEFAULT_BASE
 
-/** 账号实际模型目录：agent/list（实例 id + 可用模型）× config/get（倍率）。
+// apikey/get v1 的进程内缓存（5 分钟）：models() 调用频繁，key+倍率不用每次拉
+let llKeyRatesCache
+const LLMKEY_TTL = 5 * 60e3
+
+async function llmKeyAndRates(appAuth) {
+  const cached = llKeyRatesCache
+  if (cached && cached.appAuth === appAuth && Date.now() - cached.at < LLMKEY_TTL) return cached.data
+  const data = await fetchLlmKeyAndRates(appAuth, llmChannelId())
+  llKeyRatesCache = { appAuth, data, at: Date.now() }
+  return data
+}
+
+/** 账号实际模型目录：agent/list（实例 id + 可用模型）× apikey/get v1（key+倍率，
+ *  mobile:/pc: 票通用）× config/get（兜底，仅 mobile: 票）。
  *  ⚠️ 宿主传给钩子的 provider 是它归一化过的对象（自定义字段会被剥掉），
  *  所以这里只用闭包值，绝不读 provider 参数上的 base/openclawId。 */
 async function accountModels(provider, { auth } = {}) {
-  const appAuth = auth?.metadata?.appAuth?.trim()
+  const appAuth = appAuthOf(auth)
   if (!appAuth) return provider.models
   let agentList
   try {
@@ -489,24 +559,35 @@ async function accountModels(provider, { auth } = {}) {
     if (!openclawIdCache) return provider.models // 连实例 id 都拿不到时保留静态目录
     agentList = { agentId: openclawIdCache, models: [] }
   }
-  let catalogue
+  let rates = new Map()
+  let names = new Map()
   try {
-    catalogue = await fetchModelCatalogue(appAuth, agentList.agentId)
+    // 首选 apikey/get v1：一张票拿全 key + 倍率，网页票（pc:）也认
+    const data = await llmKeyAndRates(appAuth)
+    if (Array.isArray(data.modelList)) {
+      rates = new Map(data.modelList.map((m) => [m?.modelCode, Number(m?.tokenRatio)]))
+      names = new Map(data.modelList.map((m) => [m?.modelCode, m?.modelName]))
+    }
   } catch (error) {
     if (error.signIn === 'expired') throw error
-    catalogue = [] // 倍率表失败时仍可用 agent 列表（无倍率）
+    // 兜底 config/get（App 渠道票专用）；再失败就只剩 agent 列表（无倍率）
+    try {
+      const catalogue = await fetchModelCatalogue(appAuth, agentList.agentId)
+      rates = new Map(catalogue.map((m) => [m?.code, Number(m?.tokenRatio)]))
+      names = new Map(catalogue.map((m) => [m?.code, m?.name]))
+    } catch (fallbackError) {
+      if (fallbackError.signIn === 'expired') throw fallbackError
+    }
   }
-  const ratios = new Map(catalogue.map((m) => [m?.code, Number(m?.tokenRatio)]))
-  const names = new Map(catalogue.map((m) => [m?.code, m?.name]))
   const models = {}
   const source = agentList.models.length
     ? agentList.models
-    : catalogue.map((m) => ({ code: m?.code, name: m?.name }))
+    : [...names].map(([code, name]) => ({ code, name }))
   for (const am of source) {
     const id = am?.code
     if (typeof id !== 'string' || !id) continue
     const base = provider.models?.[id] ?? {}
-    const rate = ratios.get(id)
+    const rate = rates.get(id)
     const image = visionByCode(id)
     models[id] = {
       ...base,
@@ -550,13 +631,13 @@ export const MclawAuthPlugin = async (_input, options) => {
       methods: [
         {
           type: 'api',
-          label: 'MClaw API Key（llm 开放接口）',
+          label: '手动粘贴（API Key + 抓包凭证）',
           placeholder: 'na-…（ai.yun.139.com 开放接口 key，管 chat）',
           prompts: [
             {
               type: 'text',
               key: 'appAuth',
-              message: 'App Basic 凭证（可选：移动云 App 请求的 Authorization 头，启用模型目录与 token 用量）',
+              message: 'App/网页 Basic 票（可选：App 抓包 Authorization 头，或浏览器登录的票；启用模型目录与 token 用量）',
               placeholder: 'Basic bW9iaWxlOj…',
             },
             {
@@ -591,13 +672,70 @@ export const MclawAuthPlugin = async (_input, options) => {
             return { type: 'success', metadata }
           },
         },
+        {
+          type: 'oauth',
+          label: '浏览器登录（推荐：短信登录一次，凭证全自动）',
+          prompts: [
+            {
+              type: 'password',
+              key: 'apiKey',
+              message: 'llm API key（可选，留空自动获取）。点「确定」后会弹出专用 Chrome 窗口：请在里面登录移动云（yun.139.com，短信验证码），登录成功后本流程自动继续并收走全部凭证',
+              placeholder: '留空自动获取 / na-…',
+            },
+            {
+              type: 'text',
+              key: 'vipCookie',
+              message: 'vip.yun.139.com Cookie（可选：最近逐条明细；不填也能看总量与重置时间）',
+              placeholder: 'mc_at=…; mc_bt=…',
+            },
+          ],
+
+          // 流程：插件自己弹一个专属 profile 的 Chrome（CDP 管道驱动，不占端口），
+          // 用户在窗口里完成移动云短信登录 → 插件收割 authorization Cookie
+          // （= pc: 票）→ apikey/get v1 自动取 llm key → 存为 oauth 型
+          // { refresh:'browser', access, expires, metadata }，到期前宿主调
+          // refresh 钩子 headless 续期。
+          async authorize(inputs = {}) {
+            const manualKey = String(inputs?.apiKey ?? '').trim()
+            const vipCookie = String(inputs?.vipCookie ?? '').trim()
+            const harvest = await browserHarvestAfterLogin()
+            const { cookie, release, close } = harvest
+            try {
+              const token = cookie.value
+              const expires = basicExpiryMs(token) ?? (cookie.expiresMs || undefined)
+              // 票校验 + 自动取 key（顺带拿到倍率表，缓存给 models 用）
+              let fetchedKey
+              try {
+                fetchedKey = (await llmKeyAndRates(token)).apikey
+              } catch (error) {
+                if (error.signIn === 'expired') {
+                  return { type: 'failed', error: `登录票校验失败：${error.message}` }
+                }
+                fetchedKey = undefined // 网络抖动不拦登录，key 还有手动兜底
+              }
+              const apiKey = manualKey || fetchedKey
+              if (!apiKey) {
+                return { type: 'failed', error: '登录成功但未能自动获取 llm key（网络异常？），请在可选项里手动填 API Key 后重试' }
+              }
+              const metadata = { apiKey }
+              if (vipCookie) metadata.vipCookie = vipCookie
+              const email = nameFromAppAuth(token)
+              if (email) metadata.email = email
+              return { type: 'success', refresh: 'browser', access: token, expires, metadata }
+            } finally {
+              await close().catch(() => {})
+              release()
+            }
+          },
+        },
       ],
 
-      // 每个账号请求所带的凭证。
+      // 每个账号请求所带的凭证。chat key 两种存储形态都认：
+      // api 型在 auth.key，oauth 型（浏览器登录自动获取的）在 metadata.apiKey。
       loader: async (getAuth) => {
         const auth = await getAuth()
-        if (auth?.type !== 'api' || !auth.key) return {}
-        const key = auth.key
+        const key = String(auth?.type === 'oauth' ? auth?.metadata?.apiKey : auth?.key ?? '').trim()
+        if (!key) return {}
         return {
           baseURL: `${base}/v1`,
 
@@ -612,8 +750,8 @@ export const MclawAuthPlugin = async (_input, options) => {
 
       async usage(getAuth) {
         const auth = await getAuth()
-        const appAuth = auth?.metadata?.appAuth?.trim()
-        if (!appAuth) return { windows: [] } // 未配 App 凭证，无用量可查
+        const appAuth = appAuthOf(auth)
+        if (!appAuth) return { windows: [] } // 未配 Basic 票，无用量可查
         try {
           const item = await fetchBenefit(appAuth)
           if (!item) return { error: '权益列表里没有 aitokens（RHR135）', windows: [] }
@@ -666,13 +804,32 @@ export const MclawAuthPlugin = async (_input, options) => {
         }
       },
 
-      // 未验证到 token 续期协议；Basic 凭证到期（文本内嵌到期时间）后需重新抓取。
+      // 浏览器登录账号（refresh === 'browser'）的自动续期：headless 复开专属
+      // profile，网页应用自己刷新会话后重新收割 authorization Cookie；票换了
+      // 就顺手刷新 metadata.apiKey。到期前 refreshLead 触发；其他形态原样返回。
+      refreshLead: 3 * 24 * 3600e3,
+      async refresh(auth) {
+        if (auth?.refresh !== 'browser' || !auth?.access) return {}
+        const { cookie } = await browserRefreshHarvest()
+        const token = cookie.value
+        const expires = basicExpiryMs(token) ?? (cookie.expiresMs || auth.expires)
+        const metadata = { ...(auth.metadata ?? {}) }
+        if (token !== auth.access) {
+          try {
+            metadata.apiKey = (await llmKeyAndRates(token)).apikey
+          } catch {} // key 拉不到就保留旧值，chat 不一定受影响
+        }
+        return { access: token, expires, metadata }
+      },
     },
   }
 }
 
 // 测试面（node --test / bun test）。除插件本身外不要导出别的函数。
-export const _internal = { MODELS, appHeaders, visionByCode, nameFromAppAuth, endTimeMs, basicExpiryMs, nextResetMs }
+export const _internal = {
+  MODELS, appHeaders, visionByCode, nameFromAppAuth, endTimeMs, basicExpiryMs,
+  nextResetMs, appAuthOf, llmChannelId,
+}
 
 // OpenCode v1 形态：默认导出 { id, server }，宿主只取 server。
 export default { id: PROVIDER, server: MclawAuthPlugin }
