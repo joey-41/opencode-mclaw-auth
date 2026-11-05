@@ -726,7 +726,8 @@ export const MclawAuthPlugin = async (_input, options) => {
           const total = Number(item.benefitValue)
           const used = Number(item.benefitUsed)
           const window = {
-            name: `MClaw tokens（${item.benefitNo}）`,
+            // 权益识别走 benefitNo（RHR135），卡片名不带编号。
+            name: 'MClaw tokens',
             used: total > 0 ? (used / total) * 100 : 0,
             amount: used,
             limit: total,
