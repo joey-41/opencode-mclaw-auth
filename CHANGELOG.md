@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.2 — 2026-11-05
+
+- **用量窗口补全周期字段**：`resetsAt` 改为宿主标准的 ISO 字符串，并带上 `startsAt` + `span`（锚点 11 日 15:20:47 回退一个日历月的周期起点与秒数）。实测当前 magpie（0.1.2906）的插件桥会把这两个量剥掉（startsAt 留给自家网关窗口），额度卡片的「按此速度，预计…」推算由宿主自身的历史采样（≥3 个读数且跨度 ≥1 小时）得出——账号刚添加时没有推算行是正常现象，挂几个小时读数够了就会出。
+- 明细 endTime 已是上轮周期（过期）时不再采用，退回锚点推算，避免「重置于」显示过去的时间。
+
 ## 0.4.1 — 2026-11-05
 
 - **修复浏览器登录在宿主里必然失败的问题**：宿主（magpie/OpenCode）的 oauth 契约要求 `authorize()` 立即返回 `{ url, opened, instructions, method, callback }`、由宿主随后调 `callback()` 等登录完成；原实现把弹 Chrome + 等登录 + 收割全部阻塞在 `authorize()` 里并直接返回凭证，宿主拿不到 callback 直接报 "sign-in gave nothing to finish it with"。现在 Chrome 照样由 authorize 弹出，收割/验票/自动取 key 挪进 `callback()`（OpenCode 1.x、2.x、magpie 三宿主实测走通）。

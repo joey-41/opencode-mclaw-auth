@@ -381,6 +381,18 @@ function nextResetMs(from = Date.now()) {
   return undefined
 }
 
+/** 周期起点：锚点（11 日 15:20:47）从 resetsAt 回退一个日历月（北京时间），
+ *  即当前周期的开始。上游不给周期起止，只能由锚点推出。锚点固定在 11 日，
+ *  UTC 月份即北京月份（15:20+08 = 07:20 同日 UTC）。 */
+function periodStartMs(resetsAt) {
+  const d = new Date(resetsAt)
+  let year = d.getUTCFullYear()
+  let month = d.getUTCMonth() + 1 // 1-based
+  month -= 1
+  if (month === 0) { month = 12; year -= 1 }
+  return new Date(`${year}-${String(month).padStart(2, '0')}-11T15:20:47+08:00`).getTime()
+}
+
 // vip 会话 Cookie 的进程内缓存与 SSO 冷却（宿主进程长驻，缓存跨请求有效）
 const cookieCache = new Map()
 const ssoFailedAt = new Map()
@@ -741,10 +753,23 @@ export const MclawAuthPlugin = async (_input, options) => {
             if (fresh) records = await fetchRecords(fresh).catch(() => undefined)
           }
           const latest = records?.[0]
-          const resetsAt = endTimeMs(latest?.endTime) ?? nextResetMs()
-          if (resetsAt) window.resetsAt = resetsAt
+          const end = endTimeMs(latest?.endTime)
+          // 明细的 endTime 是当前周期权威终点；记录太旧（上轮周期的）时退回锚点推算。
+          const resetsAt = (end && end > Date.now() ? end : undefined) ?? nextResetMs()
+          if (resetsAt) {
+            // 周期起点 = 锚点回退一个日历月。窗口形态带上 startsAt + span（秒）：
+            // 这是额度窗口形态的完整字段。当前 magpie（0.1.2906）的插件桥会把
+            // 这两个量剥掉（startsAt 留给自家网关窗口），「按此速度，预计…」
+            // 由宿主自己的历史采样（≥3 点且 ≥1h）另算；宿主哪天不剥了即生效。
+            const start = periodStartMs(resetsAt)
+            window.resetsAt = new Date(resetsAt).toISOString()
+            if (start > 0 && start < resetsAt) {
+              window.startsAt = new Date(start).toISOString()
+              window.span = (resetsAt - start) / 1000
+            }
+          }
           const reset = resetsAt
-            ? ` · 重置于 ${new Date(resetsAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}${latest ? '' : '（按月周期推算）'}`
+            ? ` · 重置于 ${new Date(resetsAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}${latest && end > Date.now() ? '' : '（按月周期推算）'}`
             : ''
           window.display += reset
           if (latest) {
