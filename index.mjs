@@ -274,8 +274,8 @@ async function fetchLlmKeyAndRates(appAuth, channelId = '102001') {
   return data
 }
 
-/** 两种存储形态的 Basic 票：oauth 型（浏览器登录）在 access，api 型（手动粘贴）
- *  在 metadata.appAuth。 */
+/** 两种存储形态的 Basic 票：oauth 型（浏览器登录）在 access；api 型（0.4.1 已移除的
+ *  手动粘贴方式）的老账号在 metadata.appAuth，登录方式删了，老登录态仍兼容。 */
 function appAuthOf(auth) {
   const raw = auth?.access ?? auth?.metadata?.appAuth
   return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined
@@ -335,25 +335,6 @@ async function fetchRecords(vipCookie) {
     throw new Error(`MClaw 明细查询失败（${desc}）`)
   }
   return json?.data?.aiTokenConsumptionRecordList ?? []
-}
-
-/** 账号昵称（vip 会话；App 自己显示的就是掩码手机号）。 */
-async function fetchNickName(vipCookie) {
-  const response = await fetch(`${VIP_BASE}/m4c/userDetail/queryUserBaseInfo`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      cookie: vipCookie,
-      origin: VIP_BASE,
-      referer: `${VIP_BASE}/vip/consumptionDetail?sourceid=503016`,
-      'user-agent': APP_UA,
-    },
-    body: '{}',
-    signal: AbortSignal.timeout(15_000),
-  })
-  const json = await response.json().catch(() => null)
-  const name = json?.data?.nickName
-  return typeof name === 'string' && name.trim() ? name.trim() : undefined
 }
 
 /** 从 Basic 票里解出掩码手机号（mobile:/pc: 前缀均可），解不出返回空。 */
@@ -630,49 +611,6 @@ export const MclawAuthPlugin = async (_input, options) => {
       provider: PROVIDER,
       methods: [
         {
-          type: 'api',
-          label: '手动粘贴（API Key + 抓包凭证）',
-          placeholder: 'na-…（ai.yun.139.com 开放接口 key，管 chat）',
-          prompts: [
-            {
-              type: 'text',
-              key: 'appAuth',
-              message: 'App/网页 Basic 票（可选：App 抓包 Authorization 头，或浏览器登录的票；启用模型目录与 token 用量）',
-              placeholder: 'Basic bW9iaWxlOj…',
-            },
-            {
-              type: 'text',
-              key: 'vipCookie',
-              message: 'vip.yun.139.com Cookie（可选：最近逐条明细+权威重置时间；失效会自动尝试 SSO 换票，换不到则按月周期推算重置时间）',
-              placeholder: 'mc_at=…; mc_bt=…',
-            },
-          ],
-
-          // 登录时顺手校验 App 凭证并给账号取显示名（App 的昵称就是掩码
-          // 手机号；api 型账号的名字走 metadata.email，magpie 才认）。
-          async authorize(inputs = {}) {
-            const appAuth = String(inputs.appAuth ?? '').trim()
-            const vipCookie = String(inputs.vipCookie ?? '').trim()
-            if (appAuth) {
-              try {
-                await fetchBenefit(appAuth)
-              } catch (error) {
-                return { type: 'failed', error: `App 凭证校验失败：${error.message}` }
-              }
-            }
-            let name
-            if (vipCookie) {
-              try { name = await fetchNickName(vipCookie) } catch {}
-            }
-            name ??= nameFromAppAuth(appAuth)
-            const metadata = {}
-            if (appAuth) metadata.appAuth = appAuth
-            if (vipCookie) metadata.vipCookie = vipCookie
-            if (name) metadata.email = name
-            return { type: 'success', metadata }
-          },
-        },
-        {
           type: 'oauth',
           label: '浏览器登录（推荐：短信登录一次，凭证全自动）',
           prompts: [
@@ -690,41 +628,59 @@ export const MclawAuthPlugin = async (_input, options) => {
             },
           ],
 
-          // 流程：插件自己弹一个专属 profile 的 Chrome（CDP 管道驱动，不占端口），
-          // 用户在窗口里完成移动云短信登录 → 插件收割 authorization Cookie
-          // （= pc: 票）→ apikey/get v1 自动取 llm key → 存为 oauth 型
-          // { refresh:'browser', access, expires, metadata }，到期前宿主调
+          // 流程：宿主契约要求 authorize 立即返回 { url, opened, instructions,
+          // method, callback }（参照 sensenova/joycode），Chrome 由 authorize 弹出、
+          // 收割等登录放进宿主随后调的 callback()。窗口是专属 profile 的 Chrome
+          // （CDP 管道驱动，不占端口）：用户在里面完成移动云短信登录 → 插件收割
+          // authorization Cookie（= pc: 票）→ apikey/get v1 自动取 llm key → 存为
+          // oauth 型 { refresh:'browser', access, expires, metadata }，到期前宿主调
           // refresh 钩子 headless 续期。
           async authorize(inputs = {}) {
             const manualKey = String(inputs?.apiKey ?? '').trim()
             const vipCookie = String(inputs?.vipCookie ?? '').trim()
-            const harvest = await browserHarvestAfterLogin()
-            const { cookie, release, close } = harvest
-            try {
-              const token = cookie.value
-              const expires = basicExpiryMs(token) ?? (cookie.expiresMs || undefined)
-              // 票校验 + 自动取 key（顺带拿到倍率表，缓存给 models 用）
-              let fetchedKey
-              try {
-                fetchedKey = (await llmKeyAndRates(token)).apikey
-              } catch (error) {
-                if (error.signIn === 'expired') {
-                  return { type: 'failed', error: `登录票校验失败：${error.message}` }
+            // 不 await：Chrome 立即弹出；若宿主中途取消（callback 没被调），
+            // 挂个空 catch 免得 10 分钟超时后刷 unhandled rejection。
+            const harvesting = browserHarvestAfterLogin()
+            harvesting.catch(() => {})
+            return {
+              url: '',
+              opened: true, // Chrome 已由本插件弹出，宿主不要再开 url
+              instructions: '已弹出专用 Chrome 窗口：请在里面登录移动云（yun.139.com，短信验证码），登录成功后本流程自动继续并收走全部凭证',
+              method: 'auto',
+              async callback() {
+                let release, close
+                try {
+                  const { cookie, release: r, close: c } = await harvesting
+                  release = r
+                  close = c
+                  const token = cookie.value
+                  const expires = basicExpiryMs(token) ?? (cookie.expiresMs || undefined)
+                  // 票校验 + 自动取 key（顺带拿到倍率表，缓存给 models 用）
+                  let fetchedKey
+                  try {
+                    fetchedKey = (await llmKeyAndRates(token)).apikey
+                  } catch (error) {
+                    if (error.signIn === 'expired') {
+                      return { type: 'failed', error: `登录票校验失败：${error.message}` }
+                    }
+                    fetchedKey = undefined // 网络抖动不拦登录，key 还有手动兜底
+                  }
+                  const apiKey = manualKey || fetchedKey
+                  if (!apiKey) {
+                    return { type: 'failed', error: '登录成功但未能自动获取 llm key（网络异常？），请在可选项里手动填 API Key 后重试' }
+                  }
+                  const metadata = { apiKey }
+                  if (vipCookie) metadata.vipCookie = vipCookie
+                  const email = nameFromAppAuth(token)
+                  if (email) metadata.email = email
+                  return { type: 'success', refresh: 'browser', access: token, expires, metadata }
+                } catch (error) {
+                  return { type: 'failed', error: error?.message ?? String(error) }
+                } finally {
+                  await close?.().catch(() => {})
+                  await release?.()
                 }
-                fetchedKey = undefined // 网络抖动不拦登录，key 还有手动兜底
-              }
-              const apiKey = manualKey || fetchedKey
-              if (!apiKey) {
-                return { type: 'failed', error: '登录成功但未能自动获取 llm key（网络异常？），请在可选项里手动填 API Key 后重试' }
-              }
-              const metadata = { apiKey }
-              if (vipCookie) metadata.vipCookie = vipCookie
-              const email = nameFromAppAuth(token)
-              if (email) metadata.email = email
-              return { type: 'success', refresh: 'browser', access: token, expires, metadata }
-            } finally {
-              await close().catch(() => {})
-              await release()
+              },
             }
           },
         },

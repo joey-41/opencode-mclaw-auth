@@ -19,13 +19,9 @@ magpie plugin login mclaw
   "summary": { "en": "Unofficial MClaw provider: China Mobile Cloud's MClaw agent (ai.yun.139.com) with an OpenAI-compatible endpoint, live model catalogue with token multipliers, aitokens pool usage and optional per-request consumption details.", "zh": "非官方 MClaw 插件：中国移动云 MClaw 智能体（ai.yun.139.com），OpenAI 兼容接口，动态模型目录与积分倍率、aitokens 池用量及可选逐条消耗明细。" } }
 ```
 
-## 登录（二选一）
+## 登录（浏览器登录，一次登录凭证全自动）
 
-`magpie plugin login mclaw` 会列出两种方式：
-
-### 方式一：浏览器登录（推荐，一次登录凭证全自动）
-
-选「浏览器登录」→ 插件弹出一个**专用 Chrome 窗口**（独立 profile，不影响你的日常浏览器）→ 在窗口里登录移动云 `yun.139.com`（短信验证码）→ 插件自动收走 `authorization` Cookie（= `pc:` 票，30 天期），并自动完成剩余一切：
+`magpie plugin login mclaw` → 选「浏览器登录」→ 插件弹出一个**专用 Chrome 窗口**（独立 profile，不影响你的日常浏览器）→ 在窗口里登录移动云 `yun.139.com`（短信验证码）→ 插件自动收走 `authorization` Cookie（= `pc:` 票，30 天期），并自动完成剩余一切：
 
 - `POST /api/llm/apikey/get`（v1）自动取回 **llm chat key**（na-…，与手动抓的一字不差）+ **9 模型倍率表**——API Key 都不用手动粘
 - agent/list 自动发现 openclawId 与账号实际模型清单
@@ -33,18 +29,6 @@ magpie plugin login mclaw
 - **自动续期**：票到期前 3 天，插件 headless 复开专用 profile，网页会话自己刷新后重新收割（票换了顺手刷新 key）
 
 可选项：llm API key（留空自动获取，自动获取失败才需要填）；vip Cookie（最近逐条明细）。
-
-### 方式二：手动粘贴
-
-| 项 | 必填 | 用途 | 从哪来 |
-|---|---|---|---|
-| **API Key** | ✅ | chat（llm 开放接口） | MClaw 开放接口 key（`na-…`） |
-| **Basic 票** | 可选 | 模型目录 + token 用量 + key/倍率自动获取 | 移动云 App 任意 `ai.yun.139.com` 请求的 `Authorization` 头整段（`Basic bW9iaWxlOj…`，ProxyPin 等抓包取一次），或浏览器登录票 |
-| **vip Cookie** | 可选 | 用量里附带最近逐条消耗明细与重置时间 | 登录 `vip.yun.139.com/vip/consumptionDetail?sourceid=503016` 后的会话 Cookie |
-
-插件会校验 Basic 票有效性（失败拦下登录），显示名 = 掩码手机号（`131****9239`，与 App 内一致）。
-
-两套凭证互不通用（实测对照）：API key 只管 chat；Basic 票只管 models/usage/key 发放。只填 API Key 也能聊天，用静态模型目录、无用量显示、账号名退化为「API key …后4位」。
 
 ## 模型（2026-11-04 快照，rate=App 的 tokenRatio 积分倍率）
 
@@ -83,7 +67,6 @@ magpie plugin login mclaw
 |---|---|---|
 | llm API key | 未观察到有效期 | 无需；浏览器登录账号在续期时顺手经 apikey/get v1 刷新 |
 | Basic 票（浏览器登录，pc:） | ~30 天（到期时间同时内嵌在票文本与 Cookie expiry） | ✅ **自动**：到期前 3 天 headless 复开专用 profile，网页会话（skey/auth_token Cookie）自己走 tokenRefresh，插件重新收割新票 |
-| Basic 票（手动粘贴，mobile:） | ~30 天（票文本 `\|RCS\|<到期ms>\|` 段） | ❌ 无续期接口（App 登录协议签发）。用量里显示「凭证至 M/D」，过期后重新抓一次再 login |
 | vip Cookie | 会话级（实测 >15h） | ⚙️ 懒自动刷新：Cookie 失效时插件自动跑 SSO 链（票 → `user-njs.yun.139.com/user/querySpecTokenV2` 出 YZsid 票 → `vip.yun.139.com/m4c/login/ssoLogin` 换会话，10 分钟冷却）。**2026-11-04 实测该链被 USER_DOMAIN 拒票**（200050409，远程出的票与出票上下文绑定），链路保留，上游放开即自动生效。换不到票时功能优雅降级 |
 
 Cookie 拿不到时（或还没配）的降级策略：用量窗口照常（Basic 凭证驱动），「重置于」按月周期推算（锚点=每月 11 日 15:20:47 北京时间，来自 `[3000万 tokens/月]` 合同周期，与明细 endTime 观测一致），只少最近明细一行。

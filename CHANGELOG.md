@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1 — 2026-11-05
+
+- **修复浏览器登录在宿主里必然失败的问题**：宿主（magpie/OpenCode）的 oauth 契约要求 `authorize()` 立即返回 `{ url, opened, instructions, method, callback }`、由宿主随后调 `callback()` 等登录完成；原实现把弹 Chrome + 等登录 + 收割全部阻塞在 `authorize()` 里并直接返回凭证，宿主拿不到 callback 直接报 "sign-in gave nothing to finish it with"。现在 Chrome 照样由 authorize 弹出，收割/验票/自动取 key 挪进 `callback()`（OpenCode 1.x、2.x、magpie 三宿主实测走通）。
+- **登录方式收敛为纯浏览器登录**：移除「手动粘贴（API Key + 抓包凭证）」登录方式与只为它服务的昵称接口调用；已有手动粘贴的老账号登录态不受影响（loader 兼容保留）。
+
 ## 0.4.0 — 2026-11-05
 
 - **浏览器登录（一次登录，凭证全自动）**：新增 oauth 型登录方式——插件弹专属 profile 的 Chrome（CDP 管道驱动 `--remote-debugging-pipe`，无端口、不碰系统浏览器），在窗口里完成移动云短信登录后，插件自动收割 `authorization` Cookie（= `pc:` 票，30 天期）。
