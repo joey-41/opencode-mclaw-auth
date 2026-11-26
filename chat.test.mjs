@@ -1,7 +1,15 @@
 // normalizeChatResponse：网关以 HTTP 200 包裸 JSON 错误、正常 JSON、SSE 流、
 // 空响应、超过旧 1MB 截断的大回复——全部本地构造，不碰网络。
-import './nonet.mjs'
-import { expect, test } from 'bun:test'
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+const expect = (actual) => ({
+  toBe: (v) => assert.equal(actual, v),
+  toContain: (v) => assert.ok(String(actual).includes(v)),
+  toEqual: (v) => assert.deepEqual(actual, v),
+  toBeTruthy: () => assert.ok(actual),
+  toBeFalsy: () => assert.ok(!actual),
+  toThrow: () => assert.throws(actual),
+})
 import { _internal } from './index.mjs'
 
 const { normalizeChatResponse } = _internal
@@ -71,4 +79,66 @@ test('JSON 但既非错误也非对话响应 → 502 invalid_response', async ()
   const out = await normalizeChatResponse(Response.json({ foo: 'bar' }))
   expect(out.status).toBe(502)
   expect((await out.json()).error.code).toBe('invalid_response')
+})
+
+// 缓存命中统计：MClaw 转发火山/DeepSeek 时 usage 缓存字段形态不一，
+// 插件要规范化成 magpie 认识的标准字段，否则缓存命中率恒为 0。
+test('normalizeUsage：顶层 cached_tokens → 三种标准形态', () => {
+  const { normalizeUsage } = _internal
+  const out = normalizeUsage({ prompt_tokens: 1000, cached_tokens: 800 })
+  expect(out.prompt_tokens_details.cached_tokens).toBe(800)
+  expect(out.input_tokens_details.cached_tokens).toBe(800)
+  expect(out.prompt_cache_hit_tokens).toBe(800)
+})
+
+test('normalizeUsage：DeepSeek prompt_cache_hit_tokens → 标准形态', () => {
+  const { normalizeUsage } = _internal
+  const out = normalizeUsage({ prompt_tokens: 1000, prompt_cache_hit_tokens: 700 })
+  expect(out.prompt_tokens_details.cached_tokens).toBe(700)
+  expect(out.input_tokens_details.cached_tokens).toBe(700)
+})
+
+test('normalizeUsage：火山 input_tokens_details.cached_tokens 保留并补齐', () => {
+  const { normalizeUsage } = _internal
+  const out = normalizeUsage({ input_tokens_details: { cached_tokens: 600 } })
+  expect(out.prompt_tokens_details.cached_tokens).toBe(600)
+  expect(out.prompt_cache_hit_tokens).toBe(600)
+})
+
+test('normalizeUsage：cache_write_tokens → cache_creation_input_tokens', () => {
+  const { normalizeUsage } = _internal
+  const out = normalizeUsage({ cache_write_tokens: 120 })
+  expect(out.prompt_tokens_details.cache_creation_input_tokens).toBe(120)
+  expect(out.input_tokens_details.cache_creation_input_tokens).toBe(120)
+})
+
+test('normalizeUsage：无缓存字段时不杜撰', () => {
+  const { normalizeUsage } = _internal
+  const out = normalizeUsage({ prompt_tokens: 100, completion_tokens: 20 })
+  expect(out.prompt_tokens_details).toBeFalsy()
+  expect(out.prompt_cache_hit_tokens).toBeFalsy()
+})
+
+test('ensureUsageRequest：流式 chat 请求补 include_usage', () => {
+  const { ensureUsageRequest } = _internal
+  const init = { method: 'POST', body: JSON.stringify({ stream: true, messages: [{ role: 'user', content: 'hi' }] }) }
+  const out = ensureUsageRequest(init)
+  expect(JSON.parse(out.body).stream_options.include_usage).toBe(true)
+  expect(init.body.includes('include_usage')).toBe(false)
+})
+
+test('ensureUsageRequest：非流式/非 JSON 请求原样返回', () => {
+  const { ensureUsageRequest } = _internal
+  const a = { body: JSON.stringify({ stream: false, messages: [] }) }
+  expect(ensureUsageRequest(a) === a).toBe(true)
+  const b = { body: 'not-json' }
+  expect(ensureUsageRequest(b) === b).toBe(true)
+})
+
+test('SSE usage 帧里的缓存字段被规范化', async () => {
+  const chunk = 'data:' + JSON.stringify({ choices: [], usage: { prompt_tokens: 100, cached_tokens: 80 } }) + '\n\n'
+  const out = await normalizeChatResponse(sseResponse([chunk]))
+  const text = await out.text()
+  expect(text).toContain('"cached_tokens":80')
+  expect(text).toContain('"prompt_cache_hit_tokens":80')
 })
