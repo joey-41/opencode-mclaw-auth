@@ -478,11 +478,79 @@ function chatError(status, code, message) {
   })
 }
 
+// 额度/token 耗尽必须转成 502，magpie 才会回退到路由组的下一个供应商。
+const QUOTA_EXHAUSTED = /quota[_\s.-]*(?:exceed|exhaust|insufficient|used\s*up)|insufficient[_\s.-]*(?:quota|balance|credit|token)|(?:credit|balance|token)[_\s.已-]*(?:exhaust|insufficient|used\s*up|耗尽|用尽|用完|不足)|额度(?:已)?(?:用尽|耗尽|用完|不足)|积分(?:已)?(?:用尽|耗尽|用完|不足)/i
+
+function quotaExhausted(value) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value ?? '')
+  return Boolean(text) && QUOTA_EXHAUSTED.test(text)
+}
+
+function errorText(message, fallback) {
+  return typeof message === 'string' && message.trim() ? message.slice(0, 500) : fallback
+}
+
+function sseErrorObject(text) {
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^data:\s*(.*)$/)
+    if (!match) continue
+    const data = match[1].trim()
+    if (!data || data === '[DONE]') continue
+    try {
+      const json = JSON.parse(data)
+      if (json?.error || json?.success === false ||
+        (json?.code !== undefined && String(json.code) !== '0000' && !json?.choices)) return json
+    } catch {}
+  }
+  return undefined
+}
+
+// 额度耗尽时 MClaw 并不返回错误信封：它照常吐一个 chat.completion.chunk，
+// 只是带上 tokenStatus:"over" 且 delta.content 为「token已耗尽」、usage 为空。
+// 这类响应带 choices，sseErrorObject 认不出来，若不单独识别就会被当成正常回复。
+const TOKEN_STATUS_EXHAUSTED = /^(?:over|exhausted|exhaust|used_?up|insufficient|empty|none|no_?quota|out)$/i
+
+function sseQuotaExhausted(text) {
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^data:\s*(.*)$/)
+    if (!match) continue
+    const data = match[1].trim()
+    if (!data || data === '[DONE]') continue
+    let json
+    try { json = JSON.parse(data) } catch { continue }
+    if (!json || typeof json !== 'object') continue
+    const status = json.tokenStatus ?? json.token_status
+    if (typeof status === 'string' && TOKEN_STATUS_EXHAUSTED.test(status.trim())) {
+      const content = json.choices?.[0]?.delta?.content ?? json.choices?.[0]?.message?.content
+      return typeof content === 'string' && content.trim() ? content.trim() : 'token已耗尽'
+    }
+    // 少数情况只给文案不给 tokenStatus，靠内容兜底（有 choices 时也算）。
+    const content = json.choices?.[0]?.delta?.content ?? json.choices?.[0]?.message?.content
+    if (typeof content === 'string' && content.trim() && content.length <= 200 &&
+      quotaExhausted(content) && !json.choices?.[0]?.delta?.tool_calls) return content.trim()
+  }
+  return undefined
+}
+
 async function normalizeChatResponse(response) {
   if (!response.ok) {
     const headers = new Headers(response.headers)
+    headers.delete('content-length')
+    headers.delete('content-encoding')
     headers.set('x-magpie-sign-in', response.status === 401 ? 'expired' : 'kept')
-    return new Response(response.body, { status: response.status, headers })
+    if (response.body) {
+      const text = await response.text()
+      if (quotaExhausted(text)) {
+        let message = text
+        try {
+          const json = JSON.parse(text)
+          message = json?.error?.message ?? json?.message ?? json?.msg ?? text
+        } catch {}
+        return chatError(502, 'quota_exhausted', errorText(message, 'MClaw 额度已耗尽'))
+      }
+      return new Response(text, { status: response.status, headers })
+    }
+    return new Response(null, { status: response.status, headers })
   }
   if (!response.body) return chatError(502, 'empty_response', 'MClaw 返回空响应')
   const reader = response.body.getReader()
@@ -517,14 +585,37 @@ async function normalizeChatResponse(response) {
     if (json?.error || json?.success === false ||
       (json?.code !== undefined && json?.code !== '0000' && !json?.choices)) {
       const code = json.error?.code ?? json.code
-      const message = json.error?.message ?? json.message
-      const status = String(code) === '01000002' ? 401 : 502
-      return chatError(status, code, typeof message === 'string'
-        ? message.slice(0, 500)
-        : 'MClaw 请求被拒绝')
+      const message = json.error?.message ?? json.message ?? json.msg
+      const exhausted = quotaExhausted(json) || quotaExhausted(message)
+      const status = exhausted ? 502 : String(code) === '01000002' ? 401 : 502
+      return chatError(status, exhausted ? 'quota_exhausted' : code,
+        errorText(message, exhausted ? 'MClaw 额度已耗尽' : 'MClaw 请求被拒绝'))
     }
     if (json?.choices) return Response.json(json)
     return chatError(502, 'invalid_response', 'MClaw 未返回有效的对话响应')
+  }
+  // HTTP 200 + SSE 也可能携带 JSON 错误事件；只在看到错误信封时多读一点。
+  const sseLooksLikeError = /"error"\s*:|"success"\s*:\s*false|"code"\s*:/.test(prefix)
+  if (prefix.trimStart().startsWith('data:') && (quotaExhausted(prefix) || sseLooksLikeError)) {
+    let scan = prefix
+    while (scan.length < 65536 && !scan.includes('\n\n') && !scan.includes('\r\n\r\n')) {
+      const next = await reader.read()
+      if (next.done) break
+      buffered.push(next.value)
+      scan += decoder.decode(next.value, { stream: true })
+    }
+    const sseError = sseErrorObject(scan)
+    if (sseError && quotaExhausted(sseError)) {
+      await reader.cancel()
+      const message = sseError.error?.message ?? sseError.message ?? sseError.msg
+      return chatError(502, 'quota_exhausted', errorText(message, 'MClaw 额度已耗尽'))
+    }
+    // 额度耗尽走的是「正常 chunk + tokenStatus:over」，没有错误信封，单独认。
+    const sseExhausted = sseQuotaExhausted(scan)
+    if (sseExhausted) {
+      await reader.cancel()
+      return chatError(502, 'quota_exhausted', errorText(sseExhausted, 'MClaw 额度已耗尽'))
+    }
   }
   // 把检查过的字节重放后正常透传流，保留工具调用增量。
   const headers = new Headers(response.headers)
