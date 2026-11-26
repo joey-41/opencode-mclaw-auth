@@ -478,6 +478,55 @@ function chatError(status, code, message) {
   })
 }
 
+// 把上游 usage 里各种缓存命中字段规范化成 magpie 能识别的标准字段。
+// MClaw 转发火山引擎/DeepSeek 时 usage 字段名不定：OpenAI 用
+// prompt_tokens_details.cached_tokens，火山用 input_tokens_details.cached_tokens，
+// DeepSeek 用 prompt_cache_hit_tokens。magpie 核心能识别这三种，但上游有时只给
+// 顶层 cached_tokens 或 cache_hit_tokens，导致缓存命中率统计为 0。
+function normalizeUsage(usage) {
+  if (!usage || typeof usage !== 'object') return usage
+  const out = { ...usage }
+  const detailsCandidates = [
+    out.prompt_tokens_details,
+    out.input_tokens_details,
+  ].filter((d) => d && typeof d === 'object')
+  let cached = null
+  for (const d of detailsCandidates) {
+    if (Number.isFinite(d.cached_tokens) && d.cached_tokens > 0) { cached = d.cached_tokens; break }
+  }
+  if (cached == null && Number.isFinite(out.cached_tokens)) cached = out.cached_tokens
+  if (cached == null && Number.isFinite(out.cache_hit_tokens)) cached = out.cache_hit_tokens
+  if (cached == null && Number.isFinite(out.prompt_cache_hit_tokens)) cached = out.prompt_cache_hit_tokens
+  if (cached == null && Number.isFinite(out.cache_read_input_tokens)) cached = out.cache_read_input_tokens
+  if (cached != null && cached > 0) {
+    out.prompt_tokens_details = { ...(out.prompt_tokens_details || {}), cached_tokens: cached }
+    out.input_tokens_details = { ...(out.input_tokens_details || {}), cached_tokens: cached }
+    out.prompt_cache_hit_tokens = cached
+  }
+  let write = null
+  for (const d of detailsCandidates) {
+    if (Number.isFinite(d.cache_creation_input_tokens) && d.cache_creation_input_tokens > 0) { write = d.cache_creation_input_tokens; break }
+  }
+  if (write == null && Number.isFinite(out.cache_creation_input_tokens)) write = out.cache_creation_input_tokens
+  if (write == null && Number.isFinite(out.cache_write_tokens)) write = out.cache_write_tokens
+  if (write != null && write > 0) {
+    out.prompt_tokens_details = { ...(out.prompt_tokens_details || {}), cache_creation_input_tokens: write }
+    out.input_tokens_details = { ...(out.input_tokens_details || {}), cache_creation_input_tokens: write }
+  }
+  return out
+}
+
+// 给 OpenAI 兼容 chat 请求强制补 stream_options.include_usage，确保上游在流式
+// 响应末尾带 usage（否则 magpie 无从统计 token 与缓存命中）。
+function ensureUsageRequest(init) {
+  if (!init || typeof init.body !== 'string') return init
+  let body
+  try { body = JSON.parse(init.body) } catch { return init }
+  if (!body || typeof body !== 'object' || !body.stream || !Array.isArray(body.messages)) return init
+  body.stream_options = { ...(body.stream_options || {}), include_usage: true }
+  return { ...init, body: JSON.stringify(body) }
+}
+
 async function normalizeChatResponse(response) {
   if (!response.ok) {
     const headers = new Headers(response.headers)
@@ -523,20 +572,61 @@ async function normalizeChatResponse(response) {
         ? message.slice(0, 500)
         : 'MClaw 请求被拒绝')
     }
-    if (json?.choices) return Response.json(json)
+    if (json?.choices) {
+      if (json.usage) json.usage = normalizeUsage(json.usage)
+      return Response.json(json)
+    }
     return chatError(502, 'invalid_response', 'MClaw 未返回有效的对话响应')
   }
-  // 把检查过的字节重放后正常透传流，保留工具调用增量。
+  // 把检查过的字节重放后透传流；逐行改写 usage 帧里的缓存字段，让 magpie
+  // 能统计到 MClaw（火山/DeepSeek 转发）的缓存命中。非 usage 帧原样输出。
   const headers = new Headers(response.headers)
   headers.delete('content-length')
   headers.delete('content-encoding')
+  const enc = new TextEncoder()
+  const dec = new TextDecoder()
+  let tail = ''
+  const processText = (text, final = false) => {
+    tail += text
+    const parts = tail.split('\n')
+    tail = final ? '' : parts.pop()
+    const out = []
+    for (const line of parts) {
+      if (line.startsWith('data:') && line.includes('usage')) {
+        const payload = line.slice(5).trim()
+        if (payload && payload !== '[DONE]') {
+          try {
+            const obj = JSON.parse(payload)
+            if (obj?.usage) {
+              obj.usage = normalizeUsage(obj.usage)
+              out.push('data:' + JSON.stringify(obj))
+              continue
+            }
+          } catch {}
+        }
+      }
+      out.push(line)
+    }
+    if (final && tail) out.push(tail)
+    return out.length ? enc.encode(out.join('\n') + (final ? '' : '\n')) : new Uint8Array(0)
+  }
   return new Response(new ReadableStream({
     async pull(controller) {
-      if (buffered.length) { controller.enqueue(buffered.shift()); return }
+      if (buffered.length) {
+        const chunk = processText(dec.decode(buffered.shift(), { stream: true }))
+        if (chunk.length) controller.enqueue(chunk)
+        return
+      }
       try {
         const next = await reader.read()
-        if (next.done) controller.close()
-        else controller.enqueue(next.value)
+        if (next.done) {
+          const chunk = processText(dec.decode(), true)
+          if (chunk.length) controller.enqueue(chunk)
+          controller.close()
+        } else {
+          const chunk = processText(dec.decode(next.value, { stream: true }))
+          if (chunk.length) controller.enqueue(chunk)
+        }
       } catch (error) { controller.error(error) }
     },
     cancel(reason) { return reader.cancel(reason) },
@@ -767,7 +857,7 @@ export const MclawAuthPlugin = async (_input, options) => {
           async fetch(input, init) {
             const headers = new Headers(init?.headers)
             headers.set('authorization', `Bearer ${key}`)
-            const response = await fetch(input, { ...init, headers })
+            const response = await fetch(input, { ...ensureUsageRequest(init), headers })
             return normalizeChatResponse(response)
           },
         }
@@ -877,7 +967,7 @@ export const MclawAuthPlugin = async (_input, options) => {
 export const _internal = {
   MODELS, appHeaders, visionByCode, nameFromAppAuth, endTimeMs, basicExpiryMs,
   appAuthOf, llmChannelId, cycleStartMs, normalizeChatResponse, accountModels, HOSTS,
-  resetSsoState, resetModelCache,
+  resetSsoState, resetModelCache, normalizeUsage, ensureUsageRequest,
 }
 
 // OpenCode v1 形态：默认导出 { id, server }，宿主只取 server。
